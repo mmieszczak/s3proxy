@@ -20,7 +20,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URLDecoder;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.OffsetDateTime;
@@ -34,6 +33,7 @@ import java.util.UUID;
 
 import com.azure.core.credential.AzureNamedKeyCredential;
 import com.azure.core.http.rest.PagedResponse;
+import com.azure.core.util.BinaryData;
 import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
@@ -58,7 +58,6 @@ import com.azure.storage.blob.options.BlockBlobSimpleUploadOptions;
 import com.azure.storage.blob.sas.BlobSasPermission;
 import com.azure.storage.blob.sas.BlobServiceSasSignatureValues;
 import com.azure.storage.blob.specialized.BlobInputStream;
-import com.azure.storage.blob.specialized.BlockBlobAsyncClient;
 import com.azure.storage.common.policy.RequestRetryOptions;
 import com.azure.storage.common.policy.RetryPolicyType;
 import com.google.common.base.Supplier;
@@ -112,8 +111,6 @@ import org.jclouds.io.Payload;
 import org.jclouds.io.PayloadSlicer;
 import org.jclouds.providers.ProviderMetadata;
 import org.jspecify.annotations.Nullable;
-
-import reactor.core.publisher.Flux;
 
 @Singleton
 public final class AzureBlobStore extends BaseBlobStore {
@@ -839,68 +836,18 @@ public final class AzureBlobStore extends BaseBlobStore {
         String uploadKey = mpu.id();
         String nonce = uploadKey.substring(STUB_BLOB_PREFIX.length());
         String blockId = makeBlockId(nonce, partNumber);
-        var asyncClient = createNonRetryingBlockBlobAsyncClient(
-                mpu.containerName(), mpu.blobName());
+        var blockClient = blobServiceClient
+                .getBlobContainerClient(mpu.containerName())
+                .getBlobClient(mpu.blobName())
+                .getBlockBlobClient();
 
         byte[] md5Hash;
         try (var is = payload.openStream();
              var his = new HashingInputStream(MD5, is)) {
             var providedMd5 = payload.getContentMetadata().getContentMD5AsHashCode();
 
-            final int maxChunkSize = 4 * 1024 * 1024;
-
-            Flux<ByteBuffer> body = Flux.generate(
-                () -> 0L,
-                (position, sink) -> {
-                    try {
-                        if (position >= contentLength) {
-                            sink.complete();
-                            return position;
-                        }
-                        int chunkSize = (int) Math.min(maxChunkSize,
-                                contentLength - position);
-                        ByteBuffer buffer = ByteBuffer.allocate(chunkSize);
-                        byte[] array = buffer.array();
-                        int totalRead = 0;
-                        while (totalRead < chunkSize) {
-                            int read = his.read(array, totalRead,
-                                    chunkSize - totalRead);
-                            if (read == -1) {
-                                if (position + totalRead < contentLength) {
-                                    sink.error(new IOException(
-                                        "Stream ended at %d bytes, expected %d".formatted(
-                                            position + totalRead, contentLength)));
-                                    return position + totalRead;
-                                }
-                                break;
-                            }
-                            totalRead += read;
-                        }
-                        if (totalRead == 0) {
-                            sink.error(new IOException(
-                                "Stream ended at %d bytes, expected %d".formatted(
-                                        position, contentLength)));
-                            return position;
-                        }
-                        buffer.position(totalRead);
-                        buffer.flip();
-                        sink.next(buffer.asReadOnlyBuffer());
-                        long nextPosition = position + totalRead;
-                        if (nextPosition >= contentLength) {
-                            sink.complete();
-                        }
-                        return nextPosition;
-                    } catch (IOException e) {
-                        sink.error(e);
-                        return position;
-                    }
-                },
-                position -> {
-                    // Stream is closed by try-with-resources
-                }
-            );
-
-            asyncClient.stageBlock(blockId, body, contentLength).block();
+            blockClient.stageBlock(blockId,
+                    BinaryData.fromStream(his, contentLength));
 
             md5Hash = his.hash().asBytes();
 
@@ -922,33 +869,6 @@ public final class AzureBlobStore extends BaseBlobStore {
                 .lowerCase().encode(md5Hash);
         Date lastModified = null;
         return MultipartPart.create(partNumber, contentLength, eTag, lastModified);
-    }
-
-    /**
-     * Creates a BlockBlobAsyncClient with retries disabled for streaming uploads.
-     * This allows us to stream directly from non-markable InputStreams without
-     * needing temp files or buffering. The S3 client can retry the entire part
-     * upload if needed.
-     */
-    private BlockBlobAsyncClient createNonRetryingBlockBlobAsyncClient(
-            String container, String blobName) {
-        var cred = creds.get();
-
-        var clientBuilder = new BlobServiceClientBuilder()
-                .endpoint(endpoint)
-                .retryOptions(NO_RETRY_OPTIONS);
-
-        if (!cred.identity.isEmpty() && !cred.credential.isEmpty()) {
-            clientBuilder.credential(
-                new AzureNamedKeyCredential(cred.identity, cred.credential));
-        } else {
-            clientBuilder.credential(new DefaultAzureCredentialBuilder().build());
-        }
-
-        return clientBuilder.buildAsyncClient()
-                .getBlobContainerAsyncClient(container)
-                .getBlobAsyncClient(blobName)
-                .getBlockBlobAsyncClient();
     }
 
     @Override
